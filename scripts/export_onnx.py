@@ -100,9 +100,10 @@ def export_from_torchscript():
             output_names=["latent_out"],
             dynamic_axes={
                 "audio_in": {2: "audio_length"},
-                "latent_out": [0],
+                "latent_out": {0: "batch", 2: "latent_time"},
             },
             do_constant_folding=False,
+            dynamo=False,
         )
         decoder(z)
         torch.onnx.export(
@@ -114,10 +115,11 @@ def export_from_torchscript():
             input_names=["latent_in"],
             output_names=["audio_out"],
             dynamic_axes={
-                "latent_in": [0],
-                "audio_out": [0],
+                "latent_in": {0: "batch", 2: "latent_time"},
+                "audio_out": {0: "batch", 2: "audio_time"},
             },
             do_constant_folding=False,
+            dynamo=False,
         )
     else:
         pretrained(x)
@@ -132,9 +134,10 @@ def export_from_torchscript():
             output_names=["audio_out"],
             dynamic_axes={
                 "audio_in": {2: "audio_length"},
-                "audio_out": [0],
+                "audio_out": {0: "batch", 2: "audio_time"},
             },
             do_constant_folding=False,
+            dynamo=False,
         )
 
 
@@ -210,9 +213,10 @@ def export_from_run():
             output_names=["latent_out"],
             dynamic_axes={
                 "audio_in": {2: "audio_length"},
-                "latent_out": [0],
+                "latent_out": {0: "batch", 2: "latent_time"},
             },
             do_constant_folding=False,
+            dynamo=False,
         )
         decoder(z)
         torch.onnx.export(
@@ -224,10 +228,11 @@ def export_from_run():
             input_names=["latent_in"],
             output_names=["audio_out"],
             dynamic_axes={
-                "latent_in": [0],
-                "audio_out": [0],
+                "latent_in": {0: "batch", 2: "latent_time"},
+                "audio_out": {0: "batch", 2: "audio_time"},
             },
             do_constant_folding=False,
+            dynamo=False,
         )
     else:
         pretrained(x)
@@ -242,9 +247,10 @@ def export_from_run():
             output_names=["audio_out"],
             dynamic_axes={
                 "audio_in": {2: "audio_length"},
-                "audio_out": [0],
+                "audio_out": {0: "batch", 2: "audio_time"},
             },
             do_constant_folding=False,
+            dynamo=False,
         )
 
 
