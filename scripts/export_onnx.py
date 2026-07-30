@@ -23,13 +23,17 @@ FLAGS = flags.FLAGS
 
 
 class MockEncoder(nn.Module):
-
     def __init__(self, pretrained: rave.RAVE):
         super().__init__()
         self.pretrained = pretrained
 
     def forward(self, x):
-        z = self.pretrained.encode(x)
+        x_enc = x
+        if self.pretrained.input_mode == "pqmf":
+            x_enc = rave.model._pqmf_encode(self.pretrained.pqmf, x_enc)
+        elif self.pretrained.input_mode == "mel":
+            x_enc = self.pretrained._mel_encode(x)
+        z = self.pretrained.encoder.encoder(x_enc)
         return self.pretrained.encoder.reparametrize(z)[0]
 
 
@@ -52,7 +56,6 @@ class MockTSModule(nn.Module):
 
 
 class MockTSEncoder(nn.Module):
-
     def __init__(self, pretrained: torch.jit._script.RecursiveScriptModule):
         super().__init__()
         self.pretrained = pretrained
@@ -136,7 +139,6 @@ def export_from_torchscript():
 
 
 def export_from_run():
-    breakpoint()
     gin.parse_config_file(os.path.join(FLAGS.run, "config.gin"))
     checkpoint = rave.core.search_for_run(FLAGS.run)
 
@@ -149,6 +151,8 @@ def export_from_run():
     for m in pretrained.modules():
         if hasattr(m, "weight_g"):
             nn.utils.remove_weight_norm(m)
+        if hasattr(m, "warmed_up"):
+            m.warmed_up = torch.tensor(1)
 
     def recursive_replace(model: nn.Module):
         for name, child in model.named_children():
