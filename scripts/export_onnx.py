@@ -1,7 +1,11 @@
+import math
+import os
+
+import numpy as np
 import torch
+import torch.nn.functional as F
 
 torch.set_grad_enabled(False)
-import os
 
 import cached_conv as cc
 import gin
@@ -19,13 +23,27 @@ flags.DEFINE_boolean(
     default=False,
     help="Split model export into separate encoder and decoder files.",
 )
+flags.DEFINE_float(
+    "fidelity",
+    default=.95,
+    lower_bound=.1,
+    upper_bound=.999,
+    help='Fidelity to use during inference (Variational mode only)',
+)
+flags.DEFINE_integer(
+    "latent_dims",
+    default=None,
+    help="Explicit latent size (power of 2). Overrides --fidelity. "
+         "Must not exceed the full latent size.",
+)
 FLAGS = flags.FLAGS
 
 
 class MockEncoder(nn.Module):
-    def __init__(self, pretrained: rave.RAVE):
+    def __init__(self, pretrained: rave.RAVE, latent_size: int):
         super().__init__()
         self.pretrained = pretrained
+        self.latent_size = latent_size
 
     def forward(self, x):
         x_enc = x
@@ -34,16 +52,30 @@ class MockEncoder(nn.Module):
         elif self.pretrained.input_mode == "mel":
             x_enc = self.pretrained._mel_encode(x)
         z = self.pretrained.encoder.encoder(x_enc)
-        return self.pretrained.encoder.reparametrize(z)[0]
+        z = self.pretrained.encoder.reparametrize(z)[0]
+        z = z - self.pretrained.latent_mean.unsqueeze(-1)
+        z = F.conv1d(z, self.pretrained.latent_pca.unsqueeze(-1))
+        z = z[:, :self.latent_size]
+        return z
 
 
 class MockDecoder(nn.Module):
-    def __init__(self, pretrained: rave.RAVE):
+    def __init__(self, pretrained: rave.RAVE, latent_size: int):
         super().__init__()
         self.pretrained = pretrained
+        self.latent_size = latent_size
+        self.full_latent_size = pretrained.latent_size
 
     def forward(self, x):
-        return self.pretrained.decode(x)
+        noise = torch.randn(
+            x.shape[0],
+            self.full_latent_size - x.shape[1],
+            x.shape[-1],
+        ).type_as(x)
+        z = torch.cat([x, noise], 1)
+        z = F.conv1d(z, self.pretrained.latent_pca.T.unsqueeze(-1))
+        z = z + self.pretrained.latent_mean.unsqueeze(-1)
+        return self.pretrained.decode(z)
 
 
 class MockTSModule(nn.Module):
@@ -196,12 +228,28 @@ def export_from_run():
 
     recursive_replace(pretrained)
 
+    if FLAGS.latent_dims is not None:
+        latent_size = FLAGS.latent_dims
+        if latent_size > pretrained.latent_size:
+            raise ValueError(
+                f"--latent_dims {latent_size} exceeds the full latent size "
+                f"{pretrained.latent_size}")
+        if latent_size < 1 or (latent_size & (latent_size - 1)) != 0:
+            raise ValueError(
+                f"--latent_dims must be a positive power of 2, got {latent_size}")
+    elif isinstance(pretrained.encoder, rave.blocks.VariationalEncoder):
+        latent_size = max(
+            np.argmax(pretrained.fidelity.numpy() > FLAGS.fidelity), 1)
+        latent_size = 2**math.ceil(math.log2(latent_size))
+    else:
+        latent_size = pretrained.latent_size
+
     x = torch.randn(1, pretrained.n_channels, 2**15)
     name = os.path.basename(os.path.normpath(FLAGS.run))
     export_path = os.path.join(FLAGS.run, name)
 
     if FLAGS.split:
-        encoder, decoder = MockEncoder(pretrained), MockDecoder(pretrained)
+        encoder, decoder = MockEncoder(pretrained, latent_size), MockDecoder(pretrained, latent_size)
         z = encoder(x)
         torch.onnx.export(
             encoder,

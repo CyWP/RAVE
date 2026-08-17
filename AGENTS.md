@@ -15,6 +15,11 @@ $env:CONDA_ENV = "C:\conda_envs\rave"
 
 Omit `--split` for a combined (non-split) export.
 
+## Options
+
+- `--fidelity <float>` (default `0.95`, range `0.1`-`0.999`): For a variational encoder, derives the reduced latent size from the model's PCA fidelity curve. A higher fidelity keeps more latent channels (more controllable dims, lower reconstruction error). Only applies to split exports.
+- `--latent_dims <int>` (optional): Explicit latent size (must be a power of 2 and not exceed the full latent size, otherwise it raises). Overrides `--fidelity` and forces the use of exactly that many PCA components.
+
 ## Expected output
 
 Three `.onnx` files in the run directory when using `--split`:
