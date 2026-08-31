@@ -36,6 +36,11 @@ flags.DEFINE_integer(
     help="Explicit latent size (power of 2). Overrides --fidelity. "
          "Must not exceed the full latent size.",
 )
+flags.DEFINE_boolean(
+    "streaming",
+    default=False,
+    help="Export a streamable model with explicit cached_conv state as inputs/outputs.",
+)
 FLAGS = flags.FLAGS
 
 
@@ -76,6 +81,78 @@ class MockDecoder(nn.Module):
         z = F.conv1d(z, self.pretrained.latent_pca.T.unsqueeze(-1))
         z = z + self.pretrained.latent_mean.unsqueeze(-1)
         return self.pretrained.decode(z)
+
+
+class StreamingWrapper(nn.Module):
+    """Turns cached_conv's internal streaming state into explicit tensor inputs/outputs.
+
+    Forward: output, *new_states = wrapper(x, *states)
+    """
+
+    def __init__(self, model, state_filter=None):
+        super().__init__()
+        self.model = model
+        self.state_modules = []
+        for name, module in model.named_modules():
+            if isinstance(module, cc.CachedPadding1d):
+                if state_filter is None or state_filter(name):
+                    self.state_modules.append((name, module, "pad"))
+            elif isinstance(module, cc.CachedConvTranspose1d):
+                if state_filter is None or state_filter(name):
+                    self.state_modules.append((name, module, "cache"))
+
+    def forward(self, x, *states):
+        if len(states) != len(self.state_modules):
+            raise ValueError(
+                f"Expected {len(self.state_modules)} states, got {len(states)}"
+            )
+        for state, (_, module, attr) in zip(states, self.state_modules):
+            setattr(module, attr, state)
+        y = self.model(x)
+        new_states = tuple(getattr(module, attr) for _, module, attr in self.state_modules)
+        return (y, *new_states)
+
+
+def make_streaming_model(model, example_input, state_filter=None):
+    """Prepare a cached-conv model for explicit-state streaming.
+
+    Returns: wrapper, initial_states, state_names
+    """
+    model.eval()
+    wrapper = StreamingWrapper(model, state_filter=state_filter)
+    cc.use_cached_conv(True)
+
+    # Run once to let CachedPadding1d.init_cache / CachedConvTranspose1d.init_cache
+    # create the buffer tensors with the correct shapes.
+    with torch.no_grad():
+        wrapper.model(example_input)
+
+    # Clone the initial state tensors.
+    all_states = []
+    for name, module, attr in wrapper.state_modules:
+        try:
+            all_states.append(getattr(module, attr).clone())
+        except AttributeError:
+            all_states.append(None)
+
+    # Clear internal cached_conv state so the wrapper receives it explicitly.
+    # Filter out zero-size and uninitialized states.
+    filtered = []
+    filtered_states = []
+    for i, (name, module, attr) in enumerate(wrapper.state_modules):
+        if all_states[i] is None:
+            continue
+        mod = module
+        if hasattr(mod, '_buffers') and attr in mod._buffers:
+            del mod._buffers[attr]
+        mod.initialized = 1
+        if all_states[i].numel() > 0:
+            filtered.append((name, module, attr))
+            filtered_states.append(all_states[i])
+
+    wrapper.state_modules = filtered
+    state_names = tuple(name for name, _, _ in wrapper.state_modules)
+    return wrapper, tuple(filtered_states), state_names
 
 
 class MockTSModule(nn.Module):
@@ -174,6 +251,9 @@ def export_from_torchscript():
 
 
 def export_from_run():
+    if FLAGS.streaming:
+        cc.use_cached_conv(True)
+
     gin.parse_config_file(os.path.join(FLAGS.run, "config.gin"))
     checkpoint = rave.core.search_for_run(FLAGS.run)
 
@@ -189,44 +269,45 @@ def export_from_run():
         if hasattr(m, "warmed_up"):
             m.warmed_up = torch.tensor(1)
 
-    def recursive_replace(model: nn.Module):
-        for name, child in model.named_children():
-            if isinstance(child, cc.convs.Conv1d):
-                conv = nn.Conv1d(
-                    child.in_channels,
-                    child.out_channels,
-                    child.kernel_size,
-                    child.stride,
-                    child._pad[0],
-                    child.dilation,
-                    child.groups,
-                    child.bias,
-                )
-                conv.weight.data.copy_(child.weight.data)
-                if conv.bias is not None:
-                    conv.bias.data.copy_(child.bias.data)
-                setattr(model, name, conv)
-            elif isinstance(child, cc.convs.ConvTranspose1d):
-                conv = nn.ConvTranspose1d(
-                    child.in_channels,
-                    child.out_channels,
-                    child.kernel_size,
-                    child.stride,
-                    child.padding,
-                    child.output_padding,
-                    child.groups,
-                    child.bias,
-                    child.dilation,
-                    child.padding_mode,
-                )
-                conv.weight.data.copy_(child.weight.data)
-                if conv.bias is not None:
-                    conv.bias.data.copy_(child.bias.data)
-                setattr(model, name, conv)
-            else:
-                recursive_replace(child)
+    if not FLAGS.streaming:
+        def recursive_replace(model: nn.Module):
+            for name, child in model.named_children():
+                if isinstance(child, cc.convs.Conv1d):
+                    conv = nn.Conv1d(
+                        child.in_channels,
+                        child.out_channels,
+                        child.kernel_size,
+                        child.stride,
+                        child._pad[0],
+                        child.dilation,
+                        child.groups,
+                        child.bias,
+                    )
+                    conv.weight.data.copy_(child.weight.data)
+                    if conv.bias is not None:
+                        conv.bias.data.copy_(child.bias.data)
+                    setattr(model, name, conv)
+                elif isinstance(child, cc.convs.ConvTranspose1d):
+                    conv = nn.ConvTranspose1d(
+                        child.in_channels,
+                        child.out_channels,
+                        child.kernel_size,
+                        child.stride,
+                        child.padding,
+                        child.output_padding,
+                        child.groups,
+                        child.bias,
+                        child.dilation,
+                        child.padding_mode,
+                    )
+                    conv.weight.data.copy_(child.weight.data)
+                    if conv.bias is not None:
+                        conv.bias.data.copy_(child.bias.data)
+                    setattr(model, name, conv)
+                else:
+                    recursive_replace(child)
 
-    recursive_replace(pretrained)
+        recursive_replace(pretrained)
 
     if FLAGS.latent_dims is not None:
         latent_size = FLAGS.latent_dims
@@ -248,7 +329,124 @@ def export_from_run():
     name = os.path.basename(os.path.normpath(FLAGS.run))
     export_path = os.path.join(FLAGS.run, name)
 
-    if FLAGS.split:
+    if FLAGS.streaming and FLAGS.split:
+        # Split streaming: export separate streaming encoder and decoder
+        encoder = MockEncoder(pretrained, latent_size)
+        decoder = MockDecoder(pretrained, latent_size)
+
+        def _encoder_filter(name):
+            if "pretrained.pqmf.inverse_conv" in name:
+                return False
+            return "pretrained.pqmf" in name or "pretrained.encoder" in name
+
+        def _decoder_filter(name):
+            return "pretrained.decoder" in name
+
+        # Build encoder wrapper
+        enc_wrapper = StreamingWrapper(encoder, state_filter=_encoder_filter)
+        with torch.no_grad():
+            enc_wrapper.model(x)  # initialize encoder caches
+        enc_initial = []
+        enc_filtered = []
+        for name, module, attr in enc_wrapper.state_modules:
+            try:
+                state = getattr(module, attr).clone()
+            except AttributeError:
+                continue
+            if state.numel() > 0:
+                enc_initial.append(state)
+                enc_filtered.append((name, module, attr))
+            if hasattr(module, '_buffers') and attr in module._buffers:
+                del module._buffers[attr]
+            module.initialized = 1
+        enc_wrapper.state_modules = enc_filtered
+
+        # Build decoder wrapper
+        dec_wrapper = StreamingWrapper(decoder, state_filter=_decoder_filter)
+        z_dummy = torch.randn(1, latent_size, 2**12)
+        with torch.no_grad():
+            dec_wrapper.model(z_dummy)  # initialize decoder caches
+        dec_initial = []
+        dec_filtered = []
+        for name, module, attr in dec_wrapper.state_modules:
+            try:
+                state = getattr(module, attr).clone()
+            except AttributeError:
+                continue
+            if state.numel() > 0:
+                dec_initial.append(state)
+                dec_filtered.append((name, module, attr))
+            if hasattr(module, '_buffers') and attr in module._buffers:
+                del module._buffers[attr]
+            module.initialized = 1
+        dec_wrapper.state_modules = dec_filtered
+
+        print(f"Encoder: {len(enc_filtered)} state modules")
+        for i, (n, s) in enumerate(zip(
+                [n for n, _, _ in enc_wrapper.state_modules], enc_initial)):
+            print(f"  {i}: {n} {tuple(s.shape)}")
+        print(f"Decoder: {len(dec_filtered)} state modules")
+        for i, (n, s) in enumerate(zip(
+                [n for n, _, _ in dec_wrapper.state_modules], dec_initial)):
+            print(f"  {i}: {n} {tuple(s.shape)}")
+
+        # Export streaming encoder
+        enc_inputs = (x, *enc_initial)
+        enc_in_names = ["audio_in"] + [f"state_{i}" for i in range(len(enc_initial))]
+        enc_out_names = ["latent_out"] + [f"state_{i}_out" for i in range(len(enc_initial))]
+        torch.onnx.export(
+            enc_wrapper, enc_inputs, f"{export_path}_encoder_streaming.onnx",
+            export_params=True, opset_version=12,
+            input_names=enc_in_names, output_names=enc_out_names,
+            dynamic_axes={
+                "audio_in": {2: "audio_length"},
+                "latent_out": {0: "batch", 2: "latent_time"},
+            },
+            do_constant_folding=True, dynamo=False,
+        )
+
+        # Export streaming decoder
+        z = torch.randn(1, latent_size, 2**12)
+        dec_inputs = (z, *dec_initial)
+        dec_in_names = ["latent_in"] + [f"state_{i}" for i in range(len(dec_initial))]
+        dec_out_names = ["audio_out"] + [f"state_{i}_out" for i in range(len(dec_initial))]
+        torch.onnx.export(
+            dec_wrapper, dec_inputs, f"{export_path}_decoder_streaming.onnx",
+            export_params=True, opset_version=12,
+            input_names=dec_in_names, output_names=dec_out_names,
+            dynamic_axes={
+                "latent_in": {0: "batch", 2: "latent_time"},
+                "audio_out": {0: "batch", 2: "audio_time"},
+            },
+            do_constant_folding=True, dynamo=False,
+        )
+    elif FLAGS.streaming:
+        wrapper, initial_states, state_names = make_streaming_model(pretrained, x)
+
+        print(f"Discovered {len(state_names)} cached_conv state modules:")
+        for i, (sname, state) in enumerate(zip(state_names, initial_states)):
+            print(f"  {i}: {sname} {tuple(state.shape)}")
+
+        inputs = (x, *initial_states)
+        input_names = ["audio_in"] + [f"state_{i}" for i in range(len(initial_states))]
+        output_names = ["audio_out"] + [f"state_{i}_out" for i in range(len(initial_states))]
+
+        torch.onnx.export(
+            wrapper,
+            inputs,
+            f"{export_path}_streaming.onnx",
+            export_params=True,
+            opset_version=12,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes={
+                "audio_in": {2: "audio_length"},
+                "audio_out": {0: "batch", 2: "audio_time"},
+            },
+            do_constant_folding=True,
+            dynamo=False,
+        )
+    elif FLAGS.split:
         encoder, decoder = MockEncoder(pretrained, latent_size), MockDecoder(pretrained, latent_size)
         z = encoder(x)
         torch.onnx.export(
